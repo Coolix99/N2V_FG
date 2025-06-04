@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+[project]
+name = "n2v_fg"
+version = "0.1.0"
+description = "custom N2V implementation"
+authors = [
+    { name="Maximilian Kotz", email="kotzmax@gmail.com" }
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+dependencies = [
+    # e.g., "numpy >= 1.22", "scipy"
+]
+requires-python = ">=3.8"
+
+[project.urls]
+"Homepage" = "https://github.com/Coolix99/N2V_FG"
