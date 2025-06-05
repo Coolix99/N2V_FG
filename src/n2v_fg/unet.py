@@ -76,11 +76,18 @@ class Up(nn.Module):
 
 class UNet2D(nn.Module):
     """
-    A shallow 2D U‐Net that treats time, color, z collectively as “channels.”
-    - in_channels: (#time × #color × #z)
-    - out_channels: however many feature maps or segmentation classes you need
-    - base_channels: number of channels after the first ConvBlock
-    - depth: number of pooling steps (will create depth+1 encoder blocks and depth+1 decoder blocks)
+    A 2D U-Net where time, color, and z are treated as part of the input channel dimension.
+    
+    This implementation uses only 2D convolutions. It consists of an encoder that reduces
+    spatial dimensions while increasing feature channels, a bottleneck, and a decoder that
+    upsamples and merges features with skip connections from the encoder.
+    
+    Parameters:
+        in_channels: number of input channels (e.g. time × color × z)
+        out_channels: number of output channels (e.g. same as in_channels for reconstruction)
+        base_channels: number of channels after the first conv block
+        depth: number of downsampling/upsampling levels
+        batchnorm: whether to use BatchNorm2d after each conv
     """
     def __init__(
         self,
@@ -92,62 +99,47 @@ class UNet2D(nn.Module):
     ):
         super().__init__()
 
-        # 1) Build the “encoder” list of ConvBlocks + Down layers.
-        #    We keep track of each stage’s output channels in `enc_channels`.
-        enc_channels = []
-        # Initial “conv” (no pooling) from in_channels → base_channels
+        # Initial convolution to lift input into feature space
         self.in_conv = ConvBlock(in_channels, base_channels, batchnorm=batchnorm)
-        enc_channels.append(base_channels)
 
-        # For each level i=1..depth, do a Down→ConvBlock doubling channels each time:
-        curr_ch = base_channels
+        # Build the encoder: each Down halves spatial size and doubles channel count
         self.downs = nn.ModuleList()
-        for i in range(depth):
-            next_ch = curr_ch * 2
-            self.downs.append(Down(curr_ch, next_ch))
-            enc_channels.append(next_ch)
-            curr_ch = next_ch
+        ch = base_channels
+        self.encoder_channels = [ch]
+        for _ in range(depth):
+            next_ch = ch * 2
+            self.downs.append(Down(ch, next_ch))
+            self.encoder_channels.append(next_ch)
+            ch = next_ch
 
-        # 2) Bottleneck: from the deepest enc_channels[-1] → 2× that
-        bottleneck_in = enc_channels[-1]
-        bottleneck_out = bottleneck_in * 2
-        self.bottleneck = ConvBlock(bottleneck_in, bottleneck_out, batchnorm=batchnorm)
+        # Bottleneck with double the last encoder channel size
+        self.bottleneck = ConvBlock(ch, ch * 2, batchnorm=batchnorm)
+        ch = ch * 2
 
-        # 3) Build the “decoder” (Up blocks).  We’ll mirror `enc_channels` (in reverse)
-        #    Each Up takes: current_channels → skip_channels, then ConvBlock(2×skip_channels → skip_channels).
+        # Build the decoder: upsample and merge with skip connections
         self.ups = nn.ModuleList()
-        curr_ch = bottleneck_out
-        for skip_ch in reversed(enc_channels):
-            self.ups.append(Up(curr_ch, skip_ch, batchnorm=batchnorm))
-            curr_ch = skip_ch
+        for skip_ch in reversed(self.encoder_channels):
+            self.ups.append(Up(ch, skip_ch, batchnorm=batchnorm))
+            ch = skip_ch
 
-        # 4) Final 1×1 conv: from “base_channels” → out_channels
-        #    After the last Up, curr_ch == enc_channels[0] == base_channels.
-        self.out_conv = nn.Conv2d(curr_ch, out_channels, kernel_size=1)
+        # Final projection to the output channel space
+        self.out_conv = nn.Conv2d(ch, out_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (N, in_channels, H, W)
+        # Collect encoder outputs for skip connections
+        skips = []
+        x = self.in_conv(x)
+        skips.append(x)
 
-        # ---- Encoder path ----
-        enc_feats = []
-
-        # Stage 0 (no pooling)
-        x0 = self.in_conv(x)
-        enc_feats.append(x0)
-
-        # Stages 1..depth
-        x_cur = x0
         for down in self.downs:
-            x_cur = down(x_cur)
-            enc_feats.append(x_cur)
+            x = down(x)
+            skips.append(x)
 
-        # x_cur is now at the “deepest” resolution
-        # ---- Bottleneck ----
-        x_cur = self.bottleneck(x_cur)
+        # Bottom of the U
+        x = self.bottleneck(x)
 
-        # ---- Decoder path (use reversed enc_feats) ----
-        for up_block, skip_feat in zip(self.ups, reversed(enc_feats)):
-            x_cur = up_block(x_cur, skip_feat)
+        # Reverse skip list to align with decoder order
+        for up, skip in zip(self.ups, reversed(skips)):
+            x = up(x, skip)
 
-        # ---- Final 1×1 conv to get desired out_channels ----
-        return self.out_conv(x_cur)
+        return self.out_conv(x)
