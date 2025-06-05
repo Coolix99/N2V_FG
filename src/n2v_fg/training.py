@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
 from n2v_fg.dataset import Noise2VoidDataset
-from n2v_fg.unet import UNet2D
+from n2v_fg.unet import UNet2D_GN as UNet2D
 
 
 def train_noise2void(
@@ -156,8 +156,7 @@ def train_noise2void(
         in_channels=in_channels,
         out_channels=out_channels,
         base_channels=base_channels,
-        depth=depth,
-        batchnorm=True,
+        depth=depth
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -222,6 +221,15 @@ def train_noise2void(
             avg_val_loss = val_loss_total / max(val_batches, 1)
             logger.info(f"Epoch {epoch}/{num_epochs} — Val   Loss: {avg_val_loss:.6f}")
 
+        #debugging
+        # import napari
+        # viewer = napari.Viewer()
+        # viewer.add_image(orig_patch.cpu().detach().numpy(), name='orig_patch')
+        # viewer.add_image(masked_in.cpu().detach().numpy(), name='masked_in')
+        # viewer.add_image(mask.cpu().detach().numpy(), name='mask')
+        # viewer.add_image(output.cpu().detach().numpy(), name='output')
+        # napari.run()
+
     # ------------------------
     # 5) Save the final model (only based on training)
     # ------------------------
@@ -235,8 +243,7 @@ def train_noise2void(
             "in_channels": in_channels,
             "out_channels": out_channels,
             "base_channels": base_channels,
-            "depth": depth,
-            "batchnorm": True,
+            "depth": depth
         }
         torch.save(
             {

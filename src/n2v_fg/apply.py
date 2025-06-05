@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from n2v_fg.unet import UNet2D
+from n2v_fg.unet import UNet2D_GN as UNet2D  # or your chosen U‐Net class
 
 
 def _extract_patch(
@@ -17,10 +17,9 @@ def _extract_patch(
     t_patch: int, y_patch: int, x_patch: int
 ) -> torch.Tensor:
     """
-    Helper: Extract a sub-volume of shape (t_patch, Z, C, y_patch, x_patch)
+    Helper: Extract a sub‐volume of shape (t_patch, Z, C, y_patch, x_patch)
     from `volume` (shape (T, Z, C, Y, X)) starting at indices (t0, y0, x0).
     """
-    # volume: (T, Z, C, Y, X)
     return volume[
         t0 : t0 + t_patch,
         :,
@@ -44,7 +43,7 @@ def _unflatten_channels_to_tzc(
     t_patch: int, Z: int, C: int
 ) -> torch.Tensor:
     """
-    Un-flatten a 3D tensor (C_total, y_patch, x_patch) back to
+    Un‐flatten a 3D tensor (C_total, y_patch, x_patch) back to
     a 5D patch (t_patch, Z, C, y_patch, x_patch).
     """
     C_total, H, W = patch_3d.shape
@@ -58,7 +57,7 @@ def _apply_tta_and_predict(
     device: torch.device
 ) -> torch.Tensor:
     """
-    Perform Test-Time Augmentation (TTA) on a single patch. We apply:
+    Perform Test‐Time Augmentation (TTA) on a single patch. We apply:
       - 90° rotations k=0..3 in the XY plane
       - horizontal flip (X), vertical flip (Y)
     For each transform, we run the network, invert the transform on the output,
@@ -107,13 +106,17 @@ def apply_network(
     model: Union[UNet2D, torch.nn.Module, str],
     volume: Union[np.ndarray, torch.Tensor],
     patch_size: Tuple[int, int, int] = (8, 128, 128),
-    stride: Tuple[int, int, int] = (1, 32, 32),
+    stride: Tuple[int, int, int]     = (1, 32, 32),
     device: Union[str, torch.device] = "cpu",
     tta: bool = False
 ) -> np.ndarray:
     """
     Apply a trained UNet2D to a 5D volume (T, Z, C, Y, X) in overlapping patches
-    so that the output has exactly the same shape (T, Z, C, Y, X).
+    so that the output has exactly the same shape (T, Z, C, Y, X), but **ignores
+    a border** around each patch to eliminate seam artifacts.
+
+    Cropping margins are computed as roughly 1/8th of y_patch and x_patch.
+    This ensures that any border‐padding effects do not bleed into the final output.
 
     Arguments:
         model: Either a UNet2D instance (already loaded on `device`) or
@@ -122,20 +125,17 @@ def apply_network(
         patch_size: (t_patch, y_patch, x_patch) for the sliding window.
         stride:     (t_stride, y_stride, x_stride) for how far to move the window each step.
                     Overlaps are created when stride < patch_size.
-        device: "cpu" or "cuda" (or torch.device).
-        tta:     If True, use test-time augmentation (rotations and flips in XY) for each patch.
+        device: `"cpu"` or `"cuda"` (or torch.device).
+        tta:     If True, use test‐time augmentation (rotations and flips in XY) for each patch.
 
     Returns:
         out_volume: NumPy array of shape (T, Z, C, Y, X) containing the network’s output,
-                    reconstructed by averaging overlapping patches.
+                    reconstructed by averaging only the **central** region of each patch.
     """
-    # Ensure model is a UNet2D on the correct device
+    # 1) Load / instantiate the network on the correct device
     if isinstance(model, str):
-        # load checkpoint
         checkpoint = torch.load(model, map_location="cpu")
-        # We need to know in_channels / out_channels to instantiate the same architecture.
-        # Here, assume they saved in the checkpoint a small dict with keys "state_dict" and "arch_kwargs".
-        if "arch_kwargs" in checkpoint:
+        if "arch_kwargs" in checkpoint and "state_dict" in checkpoint:
             arch_kwargs = checkpoint["arch_kwargs"]
             net = UNet2D(**arch_kwargs).to(device)
             net.load_state_dict(checkpoint["state_dict"])
@@ -145,23 +145,31 @@ def apply_network(
         net = model.to(device)
     net.eval()
 
-    # Convert input volume to torch.Tensor on CPU
+    # 2) Convert input volume to a CPU tensor
     if isinstance(volume, np.ndarray):
         vol = torch.from_numpy(volume).float()
     else:
         vol = volume.float()
-    # vol shape: (T, Z, C, Y, X)
+    # vol shape must be (T, Z, C, Y, X)
     assert vol.ndim == 5, f"Volume must be 5D (T, Z, C, Y, X), got {vol.shape}"
     T, Z, C, Y, X = vol.shape
     t_patch, y_patch, x_patch = patch_size
     t_stride, y_stride, x_stride = stride
 
-    # Prepare output accumulators
-    # We will sum predictions into `accum_vol` and keep counts in `count_vol`
+    # 3) Decide how much to crop around each patch’s border
+    #    We choose 1/8th of y_patch and x_patch as margins.  
+    #    You can adjust these fractions if you know your network’s exact receptive field.
+    margin_y = y_patch // 8
+    margin_x = x_patch // 8
+    # Ensure at least 1 pixel of margin if patch_size is smaller than 8:
+    if margin_y < 1: margin_y = 1
+    if margin_x < 1: margin_x = 1
+
+    # 4) Prepare accumulators on CPU
     accum_vol = torch.zeros_like(vol)
     count_vol = torch.zeros_like(vol)
 
-    # Loop over patch coordinates in T, Y, X
+    # 5) Build lists of starting positions (t0, y0, x0)
     t_positions = list(range(0, T - t_patch + 1, t_stride))
     if t_positions[-1] != T - t_patch:
         t_positions.append(T - t_patch)
@@ -172,61 +180,81 @@ def apply_network(
     if x_positions[-1] != X - x_patch:
         x_positions.append(X - x_patch)
 
-    # For progress bar
     total_patches = len(t_positions) * len(y_positions) * len(x_positions)
     pbar = tqdm(total=total_patches, desc="Applying patches", unit="patch")
 
-    # Iterate
+    # 6) Slide over all patches
     for t0 in t_positions:
         for y0 in y_positions:
             for x0 in x_positions:
-                # 1) Extract patch (t_patch, Z, C, y_patch, x_patch)
+                # 6.1) Extract the raw patch (t_patch, Z, C, y_patch, x_patch)
                 patch5 = _extract_patch(vol, t0, y0, x0, t_patch, y_patch, x_patch)
-                # 2) Flatten (t_patch, Z, C)→C_total
+
+                # 6.2) Flatten (T × Z × C) → channel dimension
                 patch3 = _flatten_tzc_to_channels(patch5)
 
-                # 3) Move to device and possibly run TTA
+                # 6.3) Run through the network (with optional TTA)
                 if tta:
                     pred3 = _apply_tta_and_predict(net, patch3, torch.device(device))
                 else:
-                    inp = patch3.unsqueeze(0).to(device)  # (1, C_total, H, W)
+                    inp = patch3.unsqueeze(0).to(device)  # shape = (1, C_total, y_patch, x_patch)
                     with torch.no_grad():
-                        out = net(inp)  # (1, C_total, H, W)
-                    pred3 = out.squeeze(0).cpu()  # (C_total, H, W)
+                        out = net(inp)  # shape = (1, C_total, y_patch, x_patch)
+                    pred3 = out.squeeze(0).cpu()
 
-                # 4) Unflatten back to (t_patch, Z, C, y_patch, x_patch)
+                # 6.4) Unflatten back to (t_patch, Z, C, y_patch, x_patch)
                 pred5 = _unflatten_channels_to_tzc(pred3, t_patch, Z, C)
 
-                # 5) Add to accum_vol and increment count_vol
+                # 6.5) Crop away the outer margin in Y and X:
+                #      only keep [margin_y : y_patch - margin_y], similarly for X.
+                y1, y2 = margin_y, y_patch - margin_y
+                x1, x2 = margin_x, x_patch - margin_x
+                # ensure valid ranges
+                if y2 <= y1 or x2 <= x1:
+                    # if patch is too small, skip cropping
+                    cropped5 = pred5
+                    cy0, cy1 = 0, y_patch
+                    cx0, cx1 = 0, x_patch
+                else:
+                    cropped5 = pred5[:, :, :, y1:y2, x1:x2]
+                    cy0, cy1 = y1, y2
+                    cx0, cx1 = x1, x2
+
+                # 6.6) Accumulate only the cropped region into accum_vol/count_vol
+                #      The indices in the big volume that correspond to this cropped region are:
+                #          t: from t0 .. t0 + t_patch
+                #          z: all
+                #          c: all
+                #          y: from (y0 + cy0) .. (y0 + cy1)
+                #          x: from (x0 + cx0) .. (x0 + cx1)
                 accum_vol[
                     t0 : t0 + t_patch,
                     :,
                     :,
-                    y0 : y0 + y_patch,
-                    x0 : x0 + x_patch
-                ] += pred5
+                    y0 + cy0 : y0 + cy1,
+                    x0 + cx0 : x0 + cx1
+                ] += cropped5
+
+                # Increase count in exactly the same cropped region by 1
                 count_vol[
                     t0 : t0 + t_patch,
                     :,
                     :,
-                    y0 : y0 + y_patch,
-                    x0 : x0 + x_patch
+                    y0 + cy0 : y0 + cy1,
+                    x0 + cx0 : x0 + cx1
                 ] += 1
 
                 pbar.update(1)
 
     pbar.close()
 
-    # Avoid division by zero (shouldn’t happen if patch_size ≤ volume dims)
-    mask_zero = count_vol == 0
-    count_vol[mask_zero] = 1.0
-
-    # Compute final output by averaging
+    # 7) Normalize: avoid division by zero
+    zero_mask = (count_vol == 0)
+    count_vol[zero_mask] = 1.0
     out_vol = accum_vol / count_vol
 
-    # Convert to NumPy and return
+    # 8) Convert to NumPy and return
     return out_vol.cpu().numpy()
-
 
 if __name__ == "__main__":
     """
