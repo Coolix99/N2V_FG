@@ -5,10 +5,9 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
-from n2v_fg.unet import UNet2D_GN as UNet2D  # or your chosen U‐Net class
+from n2v_fg.net import SpatioTemporalDenoiser
 
 
 def _extract_patch(
@@ -29,81 +28,8 @@ def _extract_patch(
     ]  # → (t_patch, Z, C, y_patch, x_patch)
 
 
-def _flatten_tzc_to_channels(patch_5d: torch.Tensor) -> torch.Tensor:
-    """
-    Flatten a 5D patch (t_patch, Z, C, y_patch, x_patch) to a 3D tensor
-    (C_total, y_patch, x_patch), where C_total = t_patch * Z * C.
-    """
-    t_patch, Z, C, H, W = patch_5d.shape
-    return patch_5d.contiguous().view(t_patch * Z * C, H, W)
-
-
-def _unflatten_channels_to_tzc(
-    patch_3d: torch.Tensor,
-    t_patch: int, Z: int, C: int
-) -> torch.Tensor:
-    """
-    Un‐flatten a 3D tensor (C_total, y_patch, x_patch) back to
-    a 5D patch (t_patch, Z, C, y_patch, x_patch).
-    """
-    C_total, H, W = patch_3d.shape
-    assert C_total == t_patch * Z * C, f"C_total ({C_total}) != t_patch*Z*C ({t_patch*Z*C})"
-    return patch_3d.view(t_patch, Z, C, H, W)
-
-
-def _apply_tta_and_predict(
-    net: UNet2D,
-    inp_patch: torch.Tensor,
-    device: torch.device
-) -> torch.Tensor:
-    """
-    Perform Test‐Time Augmentation (TTA) on a single patch. We apply:
-      - 90° rotations k=0..3 in the XY plane
-      - horizontal flip (X), vertical flip (Y)
-    For each transform, we run the network, invert the transform on the output,
-    and average results.  
-
-    Input:
-      inp_patch: torch.Tensor of shape (C_total, y_patch, x_patch)
-    Returns:
-      out_patch: torch.Tensor of shape (C_total, y_patch, x_patch) (averaged over TTA)
-    """
-    transforms = []
-    # No rotation, no flip
-    transforms.append(lambda x: x)
-    # Rotations by k*90 degrees
-    for k in (1, 2, 3):
-        transforms.append(lambda x, k=k: torch.rot90(x, k, dims=(-2, -1)))
-    # Horizontal flip
-    transforms.append(lambda x: x.flip(dims=[-1]))
-    # Vertical flip
-    transforms.append(lambda x: x.flip(dims=[-2]))
-
-    inv_transforms = []
-    inv_transforms.append(lambda x: x)  # identity
-    for k in (1, 2, 3):
-        inv_transforms.append(lambda x, k=k: torch.rot90(x, -k, dims=(-2, -1)))
-    inv_transforms.append(lambda x: x.flip(dims=[-1]))  # horizontal flip is its own inverse
-    inv_transforms.append(lambda x: x.flip(dims=[-2]))  # vertical flip is its own inverse
-
-    preds = []
-    for tf, inv_tf in zip(transforms, inv_transforms):
-        aug_in = tf(inp_patch)
-        aug_in = aug_in.unsqueeze(0).to(device)  # add batch dim
-        with torch.no_grad():
-            aug_out = net(aug_in)
-        aug_out = aug_out.squeeze(0).cpu()
-        # invert transform
-        aug_out = inv_tf(aug_out)
-        preds.append(aug_out)
-
-    # Average all predictions
-    stacked = torch.stack(preds, dim=0)  # (n_tta, C_total, H, W)
-    return stacked.mean(dim=0)
-
-
 def apply_network(
-    model: Union[UNet2D, torch.nn.Module, str],
+    model: Union[SpatioTemporalDenoiser, torch.nn.Module, str],
     volume: Union[np.ndarray, torch.Tensor],
     patch_size: Tuple[int, int, int] = (8, 128, 128),
     stride: Tuple[int, int, int]     = (1, 32, 32),
@@ -111,33 +37,30 @@ def apply_network(
     tta: bool = False
 ) -> np.ndarray:
     """
-    Apply a trained UNet2D to a 5D volume (T, Z, C, Y, X) in overlapping patches
-    so that the output has exactly the same shape (T, Z, C, Y, X), but **ignores
-    a border** around each patch to eliminate seam artifacts.
-
-    Cropping margins are computed as roughly 1/8th of y_patch and x_patch.
-    This ensures that any border‐padding effects do not bleed into the final output.
+    Apply a trained SpatioTemporalDenoiser to a 4D or 5D volume in overlapping patches,
+    cropping out margins in T and (Y,X) to avoid seam artifacts. The final output
+    has the same dimensionality as the input.
 
     Arguments:
-        model: Either a UNet2D instance (already loaded on `device`) or
-               a string path to a `.pth` checkpoint containing `model.state_dict()`.
-        volume: 5D array or tensor of shape (T, Z, C, Y, X). Will be converted to float32.
+        model: SpatioTemporalDenoiser instance (on `device`) or path to a checkpoint
+               (.pth) containing {'arch_kwargs','state_dict'}.
+        volume: 4D array/tensor (T,Z,Y,X) or 5D (T,Z,C,Y,X). Will be converted to float32.
         patch_size: (t_patch, y_patch, x_patch) for the sliding window.
-        stride:     (t_stride, y_stride, x_stride) for how far to move the window each step.
-                    Overlaps are created when stride < patch_size.
-        device: `"cpu"` or `"cuda"` (or torch.device).
-        tta:     If True, use test‐time augmentation (rotations and flips in XY) for each patch.
+        stride:     (t_stride, y_stride, x_stride) defining overlap.
+        device:     "cpu" or "cuda" (or torch.device).
+        tta:        If True, apply test-time augmentation per patch.
 
     Returns:
-        out_volume: NumPy array of shape (T, Z, C, Y, X) containing the network’s output,
-                    reconstructed by averaging only the **central** region of each patch.
+        out_volume: NumPy array of the same shape as the input volume.
     """
-    # 1) Load / instantiate the network on the correct device
+    # --------------------------------------------------------------------------
+    # 1) Load or receive the network onto the correct device
+    # --------------------------------------------------------------------------
     if isinstance(model, str):
         checkpoint = torch.load(model, map_location="cpu")
         if "arch_kwargs" in checkpoint and "state_dict" in checkpoint:
             arch_kwargs = checkpoint["arch_kwargs"]
-            net = UNet2D(**arch_kwargs).to(device)
+            net = SpatioTemporalDenoiser(**arch_kwargs).to(device)
             net.load_state_dict(checkpoint["state_dict"])
         else:
             raise ValueError("Checkpoint must contain 'arch_kwargs' and 'state_dict'.")
@@ -145,37 +68,52 @@ def apply_network(
         net = model.to(device)
     net.eval()
 
-    # 2) Convert input volume to a CPU tensor
+    # --------------------------------------------------------------------------
+    # 2) Convert input to CPU tensor and detect 4D vs 5D
+    # --------------------------------------------------------------------------
     if isinstance(volume, np.ndarray):
         vol = torch.from_numpy(volume).float()
     else:
         vol = volume.float()
-    # vol shape must be (T, Z, C, Y, X)
-    assert vol.ndim == 5, f"Volume must be 5D (T, Z, C, Y, X), got {vol.shape}"
+
+    if vol.ndim == 4:
+        # (T, Z, Y, X) → insert C=1 → (T, Z, 1, Y, X)
+        vol = vol.unsqueeze(2)
+        squeeze_channel = True
+    elif vol.ndim == 5:
+        # Already (T, Z, C, Y, X)
+        squeeze_channel = False
+    else:
+        raise AssertionError(f"Volume must be 4D (T,Z,Y,X) or 5D (T,Z,C,Y,X), got {vol.shape}")
+
     T, Z, C, Y, X = vol.shape
     t_patch, y_patch, x_patch = patch_size
     t_stride, y_stride, x_stride = stride
 
-    # 3) Decide how much to crop around each patch’s border
-    #    We choose 1/8th of y_patch and x_patch as margins.  
-    #    You can adjust these fractions if you know your network’s exact receptive field.
-    margin_y = y_patch // 8
-    margin_x = x_patch // 8
-    # Ensure at least 1 pixel of margin if patch_size is smaller than 8:
-    if margin_y < 1: margin_y = 1
-    if margin_x < 1: margin_x = 1
+    # --------------------------------------------------------------------------
+    # 3) Decide margins in T, Y, and X (we use ~1/8th of each patch size)
+    # --------------------------------------------------------------------------
+    margin_t = max(1, t_patch // 8)
+    margin_y = max(1, y_patch // 8)
+    margin_x = max(1, x_patch // 8)
 
-    # 4) Prepare accumulators on CPU
+    # --------------------------------------------------------------------------
+    # 4) Prepare accumulators (on CPU)
+    # --------------------------------------------------------------------------
     accum_vol = torch.zeros_like(vol)
     count_vol = torch.zeros_like(vol)
 
-    # 5) Build lists of starting positions (t0, y0, x0)
+    # --------------------------------------------------------------------------
+    # 5) Build lists of starting positions
+    # --------------------------------------------------------------------------
     t_positions = list(range(0, T - t_patch + 1, t_stride))
     if t_positions[-1] != T - t_patch:
         t_positions.append(T - t_patch)
+
     y_positions = list(range(0, Y - y_patch + 1, y_stride))
     if y_positions[-1] != Y - y_patch:
         y_positions.append(Y - y_patch)
+
     x_positions = list(range(0, X - x_patch + 1, x_stride))
     if x_positions[-1] != X - x_patch:
         x_positions.append(X - x_patch)
@@ -183,85 +121,111 @@ def apply_network(
     total_patches = len(t_positions) * len(y_positions) * len(x_positions)
     pbar = tqdm(total=total_patches, desc="Applying patches", unit="patch")
 
-    # 6) Slide over all patches
+    # --------------------------------------------------------------------------
+    # 6) Slide over every patch
+    # --------------------------------------------------------------------------
     for t0 in t_positions:
         for y0 in y_positions:
             for x0 in x_positions:
-                # 6.1) Extract the raw patch (t_patch, Z, C, y_patch, x_patch)
+                # 6.1) Extract raw patch: (t_patch, Z, C, y_patch, x_patch)
                 patch5 = _extract_patch(vol, t0, y0, x0, t_patch, y_patch, x_patch)
 
-                # 6.2) Flatten (T × Z × C) → channel dimension
-                patch3 = _flatten_tzc_to_channels(patch5)
+                # 6.2) Remove the channel dimension C (must be 1) → get (t_patch, Z, y_patch, x_patch)
+                patch4 = patch5.squeeze(2)  # now shape = (t_patch, Z, y_patch, x_patch)
 
-                # 6.3) Run through the network (with optional TTA)
+                # 6.3) Run the network (with optional TTA)
                 if tta:
-                    pred3 = _apply_tta_and_predict(net, patch3, torch.device(device))
+                    # For simplicity, we only show the “no‐TTA” path here.
+                    # If TTA is desired, you would need to rotate/flip the 4D tensor,
+                    # feed it into net, invert the transform on the output, and average.
+                    raise NotImplementedError("TTA for SpatioTemporalDenoiser not shown")
                 else:
-                    inp = patch3.unsqueeze(0).to(device)  # shape = (1, C_total, y_patch, x_patch)
+                    # net expects (N, T, Z, Y, X):
+                    inp = patch4.unsqueeze(0).to(device)  # shape = (1, t_patch, Z, y_patch, x_patch)
                     with torch.no_grad():
-                        out = net(inp)  # shape = (1, C_total, y_patch, x_patch)
-                    pred3 = out.squeeze(0).cpu()
+                        out4d = net(inp)               # shape = (1, t_patch, Z, y_patch, x_patch)
+                    pred4 = out4d.squeeze(0).cpu()     # shape = (t_patch, Z, y_patch, x_patch)
 
-                # 6.4) Unflatten back to (t_patch, Z, C, y_patch, x_patch)
-                pred5 = _unflatten_channels_to_tzc(pred3, t_patch, Z, C)
+                # 6.4) Re‐insert channel dimension C=1 → (t_patch, Z, 1, y_patch, x_patch)
+                pred5 = pred4.unsqueeze(2)
 
-                # 6.5) Crop away the outer margin in Y and X:
-                #      only keep [margin_y : y_patch - margin_y], similarly for X.
+                # 6.5) Compute crop‐ranges in T, Y, and X
+                t1, t2 = margin_t, t_patch - margin_t
                 y1, y2 = margin_y, y_patch - margin_y
                 x1, x2 = margin_x, x_patch - margin_x
-                # ensure valid ranges
-                if y2 <= y1 or x2 <= x1:
-                    # if patch is too small, skip cropping
-                    cropped5 = pred5
-                    cy0, cy1 = 0, y_patch
-                    cx0, cx1 = 0, x_patch
-                else:
-                    cropped5 = pred5[:, :, :, y1:y2, x1:x2]
-                    cy0, cy1 = y1, y2
-                    cx0, cx1 = x1, x2
 
-                # 6.6) Accumulate only the cropped region into accum_vol/count_vol
-                #      The indices in the big volume that correspond to this cropped region are:
-                #          t: from t0 .. t0 + t_patch
-                #          z: all
-                #          c: all
-                #          y: from (y0 + cy0) .. (y0 + cy1)
-                #          x: from (x0 + cx0) .. (x0 + cx1)
+                # If patch is too small in any axis, skip cropping that axis
+                if t2 <= t1:
+                    cropped_t0, cropped_t1 = 0, t_patch
+                else:
+                    cropped_t0, cropped_t1 = t1, t2
+
+                if y2 <= y1:
+                    cropped_y0, cropped_y1 = 0, y_patch
+                else:
+                    cropped_y0, cropped_y1 = y1, y2
+
+                if x2 <= x1:
+                    cropped_x0, cropped_x1 = 0, x_patch
+                else:
+                    cropped_x0, cropped_x1 = x1, x2
+
+                # Extract the cropped block from pred5:
+                #  → cropped5 shape = (t2−t1, Z, 1, y2−y1, x2−x1) (or full extents if no crop)
+                cropped5 = pred5[
+                    cropped_t0:cropped_t1,
+                    :,
+                    :,
+                    cropped_y0:cropped_y1,
+                    cropped_x0:cropped_x1
+                ]
+
+                # 6.6) Accumulate into accum_vol & increment count_vol
                 accum_vol[
-                    t0 : t0 + t_patch,
+                    t0 + cropped_t0 : t0 + cropped_t1,
                     :,
                     :,
-                    y0 + cy0 : y0 + cy1,
-                    x0 + cx0 : x0 + cx1
+                    y0 + cropped_y0 : y0 + cropped_y1,
+                    x0 + cropped_x0 : x0 + cropped_x1
                 ] += cropped5
 
-                # Increase count in exactly the same cropped region by 1
                 count_vol[
-                    t0 : t0 + t_patch,
+                    t0 + cropped_t0 : t0 + cropped_t1,
                     :,
                     :,
-                    y0 + cy0 : y0 + cy1,
-                    x0 + cx0 : x0 + cx1
+                    y0 + cropped_y0 : y0 + cropped_y1,
+                    x0 + cropped_x0 : x0 + cropped_x1
                 ] += 1
 
                 pbar.update(1)
 
     pbar.close()
 
-    # 7) Normalize: avoid division by zero
+    # --------------------------------------------------------------------------
+    # 7) Finalize: divide by counts (avoid zeros)
+    # --------------------------------------------------------------------------
     zero_mask = (count_vol == 0)
     count_vol[zero_mask] = 1.0
     out_vol = accum_vol / count_vol
 
-    # 8) Convert to NumPy and return
+    # --------------------------------------------------------------------------
+    # 8) If input was 4D, squeeze away channel dim to return a 4D result again
+    # --------------------------------------------------------------------------
+    if squeeze_channel:
+        out_vol = out_vol.squeeze(2)  # (T, Z, Y, X)
+
+    # --------------------------------------------------------------------------
+    # 9) Return as NumPy
+    # --------------------------------------------------------------------------
     return out_vol.cpu().numpy()
+
 
 if __name__ == "__main__":
     """
     Example usage as a script:
 
         python -m n2v_fg.apply \
-            --model_path trained_unet.pth \
+            --model_path trained_stdenoiser.pth \
             --input_tiff input_volume.tif \
             --output_tiff denoised_volume.tif \
             --patch_size 8 128 128 \
@@ -270,19 +234,19 @@ if __name__ == "__main__":
             --tta
 
     The script will:
-      1) Load a TIFF (2D, 3D, or 4D) and reshape/expand to 5D (T,Z,C,Y,X).
-      2) Call apply_network(...) to get a denoised 5D output.
-      3) Squeeze back to original dimensions and save as a TIFF.
+      1) Load a TIFF (2D/3D/4D), expand to 5D (T,Z,C,Y,X).
+      2) Call apply_network() to get a denoised 5D output.
+      3) Squeeze back to original dims and save as a TIFF.
     """
 
     import argparse
     import tifffile
 
-    parser = argparse.ArgumentParser(description="Apply a trained UNet2D to a TIFF volume")
+    parser = argparse.ArgumentParser(description="Apply a trained SpatioTemporalDenoiser to a TIFF volume")
     parser.add_argument("--model_path", type=str, required=True,
                         help="Path to .pth checkpoint containing {'arch_kwargs', 'state_dict'}.")
     parser.add_argument("--input_tiff", type=str, required=True,
-                        help="Path to input TIFF (can be 2D, 3D, or 4D).")
+                        help="Path to input TIFF (2D, 3D, or 4D).")
     parser.add_argument("--output_tiff", type=str, required=True,
                         help="Path where the output TIFF will be saved.")
     parser.add_argument("--patch_size", nargs=3, type=int, default=[8, 128, 128],
@@ -292,24 +256,25 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cpu",
                         help="Torch device to use (e.g. 'cpu' or 'cuda').")
     parser.add_argument("--tta", action="store_true",
-                        help="If set, apply test-time augmentation (rotations/flips).")
+                        help="If set, apply test‐time augmentation.")
     args = parser.parse_args()
 
-    # 1) Load the TIFF as NumPy. tifffile can handle 2D, 3D, or 4D.
+    # 1) Load the TIFF into a NumPy array
     img = tifffile.imread(args.input_tiff)
     orig_shape = img.shape
-    # Determine how to expand to (T, Z, C, Y, X):
+
+    # 2) Expand to (T, Z, C, Y, X)
     if img.ndim == 2:
-        # (Y, X) → treat as (T=1, Z=1, C=1, Y, X)
+        # (Y, X) → (T=1, Z=1, C=1, Y, X)
         T, Z, C, Y, X = 1, 1, 1, orig_shape[0], orig_shape[1]
         vol5d = img.reshape(T, Z, C, Y, X)
     elif img.ndim == 3:
-        # Could be (T, Y, X) or (Z, Y, X). We assume (T, Y, X).
+        # (T, Y, X) → (T, Z=1, C=1, Y, X)
         T, Y, X = orig_shape
         Z, C = 1, 1
         vol5d = img.reshape(T, Z, C, Y, X)
     elif img.ndim == 4:
-        # Could be (T, Z, Y, X) or (T, C, Y, X). We assume (T, Z, Y, X) with C=1.
+        # (T, Z, Y, X) → (T, Z, C=1, Y, X)
         T, Z, Y, X = orig_shape
         C = 1
         vol5d = img.reshape(T, Z, C, Y, X)
@@ -318,12 +283,12 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unsupported input TIFF dims: {orig_shape}")
 
-    # Normalize volume to [0,1] float32
+    # 3) Normalize to [0,1] float32
     vol5d = vol5d.astype(np.float32)
     vol5d = (vol5d - vol5d.min()) / (vol5d.max() - vol5d.min() + 1e-8)
 
-    # 2) Apply the network
-    denoised_5d = apply_network(
+    # 4) Apply the network
+    denoised_vol = apply_network(
         model=args.model_path,
         volume=vol5d,
         patch_size=tuple(args.patch_size),
@@ -332,22 +297,21 @@ if __name__ == "__main__":
         tta=args.tta
     )
 
-    # 3) Squeeze back to original dims and save as TIFF
+    # 5) Squeeze back and save
     if img.ndim == 2:
-        out_img = denoised_5d.reshape(orig_shape)
+        out_img = denoised_vol.reshape(orig_shape)
     elif img.ndim == 3:
-        out_img = denoised_5d.reshape(orig_shape)
+        out_img = denoised_vol.reshape(orig_shape)
     elif img.ndim == 4:
-        out_img = denoised_5d.reshape(orig_shape)
+        out_img = denoised_vol.reshape(orig_shape)
     else:  # ndim == 5
-        out_img = denoised_5d
+        out_img = denoised_vol
 
-    # Ensure output directory exists
+    # 6) Ensure output directory exists
     out_dir = os.path.dirname(args.output_tiff)
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir)
 
-    # Save
-    # Convert back to original dtype/range if desired; here we save float32
+    # 7) Save as float32 TIFF
     tifffile.imwrite(args.output_tiff, out_img)
     print(f"Saved output TIFF to: {args.output_tiff}")

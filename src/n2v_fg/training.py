@@ -1,27 +1,25 @@
-# ===== File: src/n2v_fg/training.py =====
-
 import logging
 import os
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
-from n2v_fg.dataset import Noise2VoidDataset
-from n2v_fg.unet import UNet2D_GN as UNet2D
+from n2v_fg.dataset import Noise2VoidDataset3D
+from n2v_fg.net import SpatioTemporalDenoiser
 
 
 def train_noise2void(
     volumes: List[Union[np.ndarray, torch.Tensor]],
-    patch_size: Tuple[int, int, int] = (8, 128, 128),
+    patch_size: Tuple[int, int, int, int] = (8, 4, 128, 128),
     p_mask: float = 0.01,
-    rotate: bool = True,
+    rotate_xy: bool = True,
     flip_xy: bool = True,
     flip_t: bool = True,
-    base_channels: int = 32,
-    depth: int = 2,
+    flip_z: bool = False,
+    k_t: int = 3,
+    gn_channels_per_group: int = 8,
     batch_size: int = 4,
     lr: float = 1e-3,
     num_epochs: int = 20,
@@ -29,53 +27,43 @@ def train_noise2void(
     val_split: float = 0.1,
     val_volumes: Optional[List[Union[np.ndarray, torch.Tensor]]] = None,
     save_path: Optional[str] = None,
-) -> UNet2D:
+) -> SpatioTemporalDenoiser:
     """
-    Train a UNet2D in a Noise2Void fashion on 5D volumes of shape (T, Z, C, Y, X).
+    Train the SpatioTemporalDenoiser in a Noise2Void fashion on 4D volumes of shape (T, Z, Y, X).
 
-    This function will:
-      1. Create a Noise2VoidDataset from `volumes`. If `val_volumes` is None, it will
-         attempt to split a fraction `val_split` out of `volumes` for validation. 
-         If there aren’t enough volumes, it will warn and proceed without validation.
-      2. Instantiate DataLoaders for training (and, if possible, validation).
-      3. Create a UNet2D model, optimizer, and masked‐MSE criterion.
-      4. Run a standard training loop over `num_epochs` epochs, logging train/val losses.
-      5. Optionally save the final model weights to `save_path`.
+    Steps:
+      1. Build Noise2VoidDataset3D for train (and optional validation) from `volumes`.
+      2. Instantiate DataLoaders, SpatioTemporalDenoiser, optimizer, and masked‐MSE criterion.
+      3. Run training loop for `num_epochs`, logging train/val loss.
+      4. Optionally save the final model (with arch_kwargs + state_dict) to `save_path`.
 
-    Arguments:
-        volumes: List of volumes (each is either a NumPy array or a torch.Tensor of shape (T, Z, C, Y, X)).
-        patch_size: Tuple (t_patch, y_patch, x_patch) for cropping during training.
-        p_mask: Fraction of pixels to mask out in each patch (e.g. 0.01 → 1% of pixels).
-        rotate: Whether to apply random 90° rotations in the XY plane.
-        flip_xy: Whether to apply random horizontal/vertical flips in the XY plane.
-        flip_t: Whether to apply random flips along T.
-        base_channels: Number of base feature channels in the U-Net.
-        depth: Number of down/up‐sampling levels in the U-Net.
-        batch_size: Batch size for both training and validation loaders.
+    Args:
+        volumes: List of 4D arrays or tensors, each shape (T, Z, Y, X).
+        patch_size: (T_patch, Z_patch, Y_patch, X_patch) for cropping during training.
+        p_mask: fraction of voxels to mask out (~1% by default).
+        rotate_xy, flip_xy, flip_t, flip_z: augmentation flags.
+        k_t: temporal kernel size for the network’s 1D conv along T.
+        gn_channels_per_group: how many channels per group in GroupNorm.
+        batch_size: number of patches per batch.
         lr: Adam learning rate.
-        num_epochs: Number of epochs to train.
-        device: "cpu" or "cuda" or torch.device.
-        val_split: If `val_volumes` is None, this fraction of `volumes` will be held out for validation.
-        val_volumes: If provided, use these volumes (instead of splitting) to build a validation set.
-        save_path: If provided, will save `model.state_dict()` to this path at the end of training.
-
+        num_epochs: number of epochs to train.
+        device: “cpu” or “cuda” or torch.device.
+        val_split: fraction of `volumes` to hold out for validation (if `val_volumes` is None).
+        val_volumes: optionally provide a separate list of volumes for validation.
+        save_path: if provided, save trained model to this path (includes arch_kwargs).
     Returns:
-        The trained UNet2D model (on CPU if device="cpu", or on GPU if device="cuda").
+        The trained SpatioTemporalDenoiser model (on the appropriate device).
     """
-    # ------------------------
     # 1) Setup logging
-    # ------------------------
     logging.basicConfig(
         format="%(asctime)s %(levelname)s: %(message)s",
         level=logging.INFO,
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger = logging.getLogger(__name__)
-    logger.info("Starting Noise2Void training.")
+    logger.info("Starting Noise2Void training (4D).")
 
-    # ------------------------
-    # 2) Prepare datasets
-    # ------------------------
+    # 2) Split volumes into train/val if needed
     if val_volumes is None:
         num_vols = len(volumes)
         num_val = int(round(num_vols * val_split))
@@ -84,89 +72,94 @@ def train_noise2void(
         if num_train < 1 or num_val < 1:
             logger.warning(
                 f"Not enough volumes ({num_vols}) to split into train/val with val_split={val_split}. "
-                "Continuing without validation; all volumes will be used for training."
+                "Continuing without validation; all volumes used for training."
             )
             train_vols = volumes
             val_vols = []
             do_validation = False
         else:
+            # Simple split: first `num_train` → train, remainder → val
             train_vols = volumes[:num_train]
             val_vols = volumes[num_train:]
             do_validation = True
-            logger.info(f"Split {num_vols} volumes into {len(train_vols)} train / {len(val_vols)} val.")
+            logger.info(
+                f"Split {num_vols} volumes → {len(train_vols)} train / {len(val_vols)} val."
+            )
     else:
         train_vols = volumes
         val_vols = val_volumes
         do_validation = True
-        logger.info(f"Using {len(train_vols)} volumes for training and {len(val_vols)} for validation.")
+        logger.info(
+            f"Using {len(train_vols)} volumes for training and {len(val_vols)} for validation."
+        )
 
-    # Create training dataset & loader (dataset always on CPU)
-    train_dataset = Noise2VoidDataset(
+    # 3) Create training dataset & loader
+    train_dataset = Noise2VoidDataset3D(
         volumes=train_vols,
         patch_size=patch_size,
         p_mask=p_mask,
-        rotate=rotate,
+        rotate_xy=rotate_xy,
         flip_xy=flip_xy,
         flip_t=flip_t,
-        device=None,  # keep everything on CPU in workers
+        flip_z=flip_z,
+        device=None,  # keep data on CPU; move batch to device in loop
     )
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=2,
-        pin_memory=False,
+        pin_memory=(device != "cpu"),
     )
 
-    # Create validation dataset & loader (if any)
+    # 4) Create validation dataset & loader (if applicable)
     if do_validation and len(val_vols) > 0:
-        val_dataset = Noise2VoidDataset(
+        val_dataset = Noise2VoidDataset3D(
             volumes=val_vols,
             patch_size=patch_size,
             p_mask=p_mask,
-            rotate=False,
+            rotate_xy=False,  # no augmentation during validation
             flip_xy=False,
             flip_t=False,
-            device=None,  # CPU
+            flip_z=False,
+            device=None,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
             num_workers=2,
-            pin_memory=False,
+            pin_memory=(device != "cpu"),
         )
     else:
         val_loader = None
         if not do_validation:
             logger.info("Skipping validation (all data used for training).")
 
-    # ------------------------
-    # 3) Build model, optimizer, criterion
-    # ------------------------
+    # 5) Inspect one example volume to extract (T0, Z0, Y0, X0)
     example_vol = train_vols[0]
     if isinstance(example_vol, np.ndarray):
         example_vol = torch.from_numpy(example_vol)
-    T0, Z0, C0, _, _ = example_vol.shape
-    in_channels = patch_size[0] * Z0 * C0
-    out_channels = in_channels
+    T0, Z0, Y0, X0 = example_vol.shape
 
-    # Instantiate U-Net
-    model = UNet2D(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        base_channels=base_channels,
-        depth=depth
+    # 6) Instantiate the SpatioTemporalDenoiser
+    #    - num_z = Z_patch
+    #    - Use k_t, gn_channels_per_group
+    _, Zp, _, _ = patch_size  # Z_patch
+    model = SpatioTemporalDenoiser(
+        num_z=Zp,
+        k_t=k_t,
+        gn_channels_per_group=gn_channels_per_group
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Compute MSE only over masked pixels.
-        pred, target: (B, C_total, H, W)
-        mask: BoolTensor same shape, True = pixel was masked.
-        """
+    # 7) Define masked‐MSE loss (3D)
+    def masked_mse_loss(
+        pred: torch.Tensor,  # shape: (B, T_patch, Z_patch, Y_patch, X_patch)
+        target: torch.Tensor,  # same shape
+        mask: torch.Tensor      # bool, same shape
+    ) -> torch.Tensor:
         diff2 = (pred - target) ** 2
         mask_f = mask.float()  # 1.0 where True
         sum_sq = (diff2 * mask_f).sum()
@@ -175,23 +168,23 @@ def train_noise2void(
             return torch.tensor(0.0, device=diff2.device, requires_grad=False)
         return sum_sq / n_masked
 
-    # ------------------------
-    # 4) Training Loop (and optional Validation)
-    # ------------------------
+    # 8) Training + Validation Loop
     for epoch in range(1, num_epochs + 1):
-        # ---- TRAIN ----
+        # ------ TRAIN ------
         model.train()
         running_loss = 0.0
         n_batches = 0
 
-        for masked_in, orig_patch, mask in train_loader:
-            # Move batch to device here
-            masked_in = masked_in.to(device)
+        for (masked_patch, orig_patch, mask) in train_loader:
+            # masked_patch, orig_patch, mask all are torch Tensors, shape:
+            #   (batch_size, T_patch, Z_patch, Y_patch, X_patch)
+            masked_patch = masked_patch.to(device)   # FloatTensor
             orig_patch = orig_patch.to(device)
-            mask = mask.to(device)
+            mask = mask.to(device)                   # BoolTensor
 
             optimizer.zero_grad()
-            output = model(masked_in)
+            output = model(masked_patch)  # → (B, Tp, Zp, Yp, Xp)
+
             loss = masked_mse_loss(output, orig_patch, mask)
             loss.backward()
             optimizer.step()
@@ -202,18 +195,18 @@ def train_noise2void(
         avg_train_loss = running_loss / max(n_batches, 1)
         logger.info(f"Epoch {epoch}/{num_epochs} — Train Loss: {avg_train_loss:.6f}")
 
-        # ---- VALIDATION (if any) ----
+        # ----- VALIDATION -----
         if val_loader is not None:
             model.eval()
             val_loss_total = 0.0
             val_batches = 0
             with torch.no_grad():
-                for masked_in, orig_patch, mask in val_loader:
-                    masked_in = masked_in.to(device)
+                for (masked_patch, orig_patch, mask) in val_loader:
+                    masked_patch = masked_patch.to(device)
                     orig_patch = orig_patch.to(device)
                     mask = mask.to(device)
 
-                    output = model(masked_in)
+                    output = model(masked_patch)
                     loss = masked_mse_loss(output, orig_patch, mask)
                     val_loss_total += loss.item()
                     val_batches += 1
@@ -221,29 +214,16 @@ def train_noise2void(
             avg_val_loss = val_loss_total / max(val_batches, 1)
             logger.info(f"Epoch {epoch}/{num_epochs} — Val   Loss: {avg_val_loss:.6f}")
 
-        #debugging
-        # import napari
-        # viewer = napari.Viewer()
-        # viewer.add_image(orig_patch.cpu().detach().numpy(), name='orig_patch')
-        # viewer.add_image(masked_in.cpu().detach().numpy(), name='masked_in')
-        # viewer.add_image(mask.cpu().detach().numpy(), name='mask')
-        # viewer.add_image(output.cpu().detach().numpy(), name='output')
-        # napari.run()
-
-    # ------------------------
-    # 5) Save the final model (only based on training)
-    # ------------------------
+    # 9) Save the final model (including arch_kwargs for reloading)
     if save_path is not None:
         save_dir = os.path.dirname(save_path)
         if save_dir and not os.path.exists(save_dir):
             os.makedirs(save_dir)
 
-        # Build the arch_kwargs dict so that apply.py can re‐instantiate UNet2D
         arch_kwargs = {
-            "in_channels": in_channels,
-            "out_channels": out_channels,
-            "base_channels": base_channels,
-            "depth": depth
+            "num_z": Zp,
+            "k_t": k_t,
+            "gn_channels_per_group": gn_channels_per_group
         }
         torch.save(
             {
@@ -257,59 +237,98 @@ def train_noise2void(
     logger.info("Training complete.")
     return model
 
+
 if __name__ == "__main__":
     """
     Example usage as a script. Adjust the paths and hyperparameters below.
     
-    python -m n2v_fg.training
-
-    This code snippet will:
-      - Load two example volumes from .npy files
-      - Train for 10 epochs on small patches (for demonstration).
-      - Save the model to "trained_unet.pth" in the current directory.
+    python -m n2v_fg.training \
+      --train_volumes vol1.npy vol2.npy \
+      --val_volumes vol3.npy \
+      --epochs 10 --batch_size 4 --lr 1e-3 \
+      --patch_size 8 4 128 128 --p_mask 0.01 \
+      --k_t 5 --gn_group 8 \
+      --device cuda \
+      --save_path model_checkpoint.pth
     """
 
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train UNet2D in Noise2Void mode")
+    parser = argparse.ArgumentParser(description="Train SpatioTemporalDenoiser in Noise2Void mode")
     parser.add_argument(
         "--train_volumes",
         nargs="+",
-        help="Paths to .npy or .pt files containing volumes of shape (T,Z,C,Y,X).",
+        help="Paths to .npy or .pt files containing volumes of shape (T,Z,Y,X).",
         required=True,
     )
     parser.add_argument(
         "--val_volumes",
         nargs="*",
         default=[],
-        help="(Optional) Paths to validation .npy or .pt volumes. If omitted, do an internal split.",
+        help="(Optional) Paths to validation .npy or .pt volumes. If omitted, splits train set.",
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--patch_size", nargs=3, type=int, default=[8, 128, 128])
+    parser.add_argument(
+        "--patch_size",
+        nargs=4,
+        type=int,
+        default=[8, 4, 128, 128],
+        help="Patch size: (T_patch, Z_patch, Y_patch, X_patch).",
+    )
     parser.add_argument("--p_mask", type=float, default=0.01)
-    parser.add_argument("--base_channels", type=int, default=32)
-    parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument(
+        "--rotate_xy",
+        action="store_true",
+        help="Apply random 90° rotation in XY plane.",
+    )
+    parser.add_argument(
+        "--flip_xy",
+        action="store_true",
+        help="Apply random flips in X and/or Y.",
+    )
+    parser.add_argument(
+        "--flip_t",
+        action="store_true",
+        help="Apply random flip in T.",
+    )
+    parser.add_argument(
+        "--flip_z",
+        action="store_true",
+        help="Apply random flip in Z.",
+    )
+    parser.add_argument(
+        "--k_t",
+        type=int,
+        default=3,
+        help="Temporal kernel size for 1D conv along T.",
+    )
+    parser.add_argument(
+        "--gn_group",
+        type=int,
+        default=8,
+        help="Approximate channels per group for GroupNorm.",
+    )
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--save_path", type=str, default="trained_unet.pth")
+    parser.add_argument("--save_path", type=str, default="trained_stdenoiser.pth")
     parser.add_argument(
         "--val_split",
         type=float,
         default=0.1,
-        help="If no val_volumes given, fraction of train volumes to hold out for validation.",
+        help="If no val_volumes given, fraction of train set held for validation.",
     )
 
     args = parser.parse_args()
 
-    # Helper to load a volume from .npy or .pt
+    # Helper to load a 4D volume from .npy or .pt:
     def _load_volume(path: str) -> np.ndarray:
         if path.endswith(".npy"):
             return np.load(path)
         elif path.endswith(".pt"):
             return torch.load(path).cpu().numpy()
         else:
-            raise ValueError(f"Unsupported volume format: {path}")
+            raise ValueError(f"Unsupported format: {path}")
 
     train_vs = [_load_volume(p) for p in args.train_volumes]
     val_vs = [_load_volume(p) for p in args.val_volumes] if args.val_volumes else None
@@ -319,11 +338,12 @@ if __name__ == "__main__":
         val_volumes=val_vs,
         patch_size=tuple(args.patch_size),
         p_mask=args.p_mask,
-        rotate=True,
-        flip_xy=True,
-        flip_t=True,
-        base_channels=args.base_channels,
-        depth=args.depth,
+        rotate_xy=args.rotate_xy,
+        flip_xy=args.flip_xy,
+        flip_t=args.flip_t,
+        flip_z=args.flip_z,
+        k_t=args.k_t,
+        gn_channels_per_group=args.gn_group,
         batch_size=args.batch_size,
         lr=args.lr,
         num_epochs=args.epochs,
